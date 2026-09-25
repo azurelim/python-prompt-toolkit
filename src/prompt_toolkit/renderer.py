@@ -36,6 +36,8 @@ __all__ = [
     "print_formatted_text",
 ]
 
+_DEFAULT_COLORS = (None, "", "default", "ansidefault")
+
 
 def _output_screen_diff(
     app: Application[Any],
@@ -155,13 +157,57 @@ def _output_screen_diff(
           the cursor position moves around.
         - The `Window` adds a style class to the current line for highlighting
           (cursor-line).
+
+        Returns -1 for a row without visible cells, so that nothing is
+        written: a written space marks the row as used, and when the terminal
+        gets shorter, some terminals then drop rows from the top instead,
+        leaving copies of the prompt behind (#1933).
         """
         numbers = (
             index
             for index, cell in row.items()
             if cell.char != " " or style_string_has_style[cell.style]
         )
-        return max(numbers, default=0)
+        return max(numbers, default=-1)
+
+    def get_trailing_fill(
+        row: dict[int, Char], zero_width_escapes_row: dict[int, str]
+    ) -> tuple[int, str] | None:
+        """
+        Return `(start_column, style)` of a run of styled blank cells that
+        extends to the right edge, or `None`. Such a run is painted with
+        "erase end of line" instead of spaces, because terminals treat erased
+        cells as empty and don't rewrap them when the terminal becomes
+        narrower. Rewrapped full-width rows make the terminal scroll, which
+        moves the cursor and leaves copies of the prompt behind (#1933).
+        """
+        last = row.get(width - 1)
+        if last is None or last.char != " ":
+            return None
+
+        style = last.style
+        if not style_string_has_style[style]:
+            return None
+
+        # Erased cells only take the background color. For reverse video that
+        # is the foreground color, which has to be known.
+        attrs = attrs_for_style_string[style]
+        if attrs.underline or attrs.strike or attrs.blink:
+            return None
+        if attrs.reverse and attrs.color in _DEFAULT_COLORS:
+            return None
+
+        start = width - 1
+        while start > 0:
+            cell = row.get(start - 1)
+            if cell is None or cell.char != " " or cell.style != style:
+                break
+            start -= 1
+
+        if zero_width_escapes_row and max(zero_width_escapes_row) >= start:
+            return None
+
+        return start, style
 
     # Render for the first time: reset styling.
     if not previous_screen:
@@ -198,8 +244,21 @@ def _output_screen_diff(
         previous_row = previous_screen.data_buffer[y]
         zero_width_escapes_row = screen.zero_width_escapes[y]
 
-        new_max_line_len = min(width - 1, get_max_column_index(new_row))
-        previous_max_line_len = min(width - 1, get_max_column_index(previous_row))
+        new_fill = get_trailing_fill(new_row, zero_width_escapes_row)
+        previous_fill = get_trailing_fill(
+            previous_row, previous_screen.zero_width_escapes[y]
+        )
+
+        if new_fill:
+            new_max_line_len = new_fill[0] - 1
+        else:
+            new_max_line_len = min(width - 1, get_max_column_index(new_row))
+
+        # A previous fill still colors the terminal up to the right edge.
+        if previous_fill:
+            previous_max_line_len = width - 1
+        else:
+            previous_max_line_len = min(width - 1, get_max_column_index(previous_row))
 
         # Loop over the columns.
         c = 0  # Column counter.
@@ -223,8 +282,38 @@ def _output_screen_diff(
 
             c += char_width
 
+        if new_fill:
+            fill_start, fill_style = new_fill
+
+            # Skip when the terminal already shows this fill from `fill_start` on.
+            if not (
+                previous_fill
+                and previous_fill[1] == fill_style
+                and previous_fill[0] <= fill_start
+            ):
+                current_pos = move_cursor(Point(x=fill_start, y=y))
+                fill_attrs = attrs_for_style_string[fill_style]
+                if fill_attrs.reverse:
+                    _output_set_attributes(
+                        fill_attrs._replace(
+                            color=fill_attrs.bgcolor,
+                            bgcolor=fill_attrs.color,
+                            reverse=False,
+                        ),
+                        color_depth,
+                    )
+                    last_style = None
+                else:
+                    if (
+                        not last_style
+                        or fill_attrs != attrs_for_style_string[last_style]
+                    ):
+                        _output_set_attributes(fill_attrs, color_depth)
+                    last_style = fill_style
+                output.erase_end_of_line()
+
         # If the new line is shorter, trim it.
-        if previous_screen and new_max_line_len < previous_max_line_len:
+        elif previous_screen and new_max_line_len < previous_max_line_len:
             current_pos = move_cursor(Point(x=new_max_line_len + 1, y=y))
             reset_attributes()
             output.erase_end_of_line()
